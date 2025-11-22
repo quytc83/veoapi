@@ -1,0 +1,7 @@
+fastapi
+pydantic
+requests
+google-genai
+google-cloud-storage
+ffmpeg-python
+uvicorn

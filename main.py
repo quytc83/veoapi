@@ -1,32 +1,33 @@
 import os
 import io
 import time
+from datetime import datetime
 import base64
 import tempfile
+import shutil
 import requests
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl
 
 from google import genai
 from google.genai import types
-from google.cloud import storage
 import ffmpeg
 import imghdr
 
 
 
 # ---------- Config ----------
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise RuntimeError("Missing GEMINI_API_KEY")
+DEFAULT_GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-GCS_BUCKET = os.getenv("GCS_BUCKET", "tts_poc")
-PROJECT_ID = os.getenv("GCP_PROJECT")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+VIDEOS_DIR = os.path.join(SCRIPT_DIR, "videos")
+os.makedirs(VIDEOS_DIR, exist_ok=True)
 
-client = genai.Client(api_key=GEMINI_API_KEY)
 app = FastAPI(title="Veo3 Image-to-Video API (i2v+TTS)")
+app.mount("/videos", StaticFiles(directory=VIDEOS_DIR), name="videos")
 
 
 # ---------- Schemas ----------
@@ -47,9 +48,7 @@ class I2VBody(BaseModel):
     tts_voice_name: Optional[str] = "Kore"        # tên voice TTS (xem danh sách prebuilt voices)
     tts_sample_rate: int = 24000                  # PCM 24kHz theo hướng dẫn
 
-    # Upload
-    gcs_bucket: Optional[str] = None              # override bucket nếu muốn
-    gcs_prefix: Optional[str] = "veo_i2v"         # folder prefix
+    gemini_api_key: Optional[str] = None          # cho phép truyền API key mỗi request
 
 
 # ---------- Helpers ----------
@@ -98,14 +97,21 @@ def _image_part_from_input(body: I2VBody) -> types.Part:
     raise HTTPException(400, "Bạn phải truyền image_url hoặc image_base64")
 
 
-def _poll_operation(op, sleep_sec=10):
+def _get_genai_client(api_key_override: Optional[str]) -> genai.Client:
+    api_key = api_key_override or DEFAULT_GEMINI_API_KEY
+    if not api_key:
+        raise HTTPException(400, "GEMINI_API_KEY is required (set env or pass gemini_api_key).")
+    return genai.Client(api_key=api_key)
+
+
+def _poll_operation(client: genai.Client, op, sleep_sec=10):
     # Long-running operation for Veo video generation
     while not op.done:
         time.sleep(sleep_sec)
         op = client.operations.get(op)
     return op
 
-def _download_genai_file_to_bytes(file_ref) -> bytes:
+def _download_genai_file_to_bytes(client: genai.Client, file_ref) -> bytes:
     dl = client.files.download(file=file_ref)
     # Một số phiên bản trả bytes; một số trả stream-like
     if isinstance(dl, (bytes, bytearray)):
@@ -123,19 +129,19 @@ def _save_bytes(path: str, data: bytes):
     with open(path, "wb") as f:
         f.write(data)
 
-def _gcs_upload_and_signed_url(local_path: str, dest_name: str, bucket_name: str) -> str:
-    storage_client = storage.Client(project=PROJECT_ID)
-    bucket = storage_client.bucket(bucket_name)
-    blob = bucket.blob(dest_name)
-    blob.upload_from_filename(local_path, content_type="video/mp4" if local_path.endswith(".mp4") else None)
-    # Tạo signed url 7 ngày
-    url = blob.generate_signed_url(expiration=7*24*3600)
-    return url
 
+def _persist_local_copy(source_path: str, target_name: str, target_dir: Optional[str] = None) -> str:
+    base_name = os.path.basename(target_name)
+    dest_dir = target_dir or SCRIPT_DIR
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_path = os.path.join(dest_dir, base_name)
+    shutil.copyfile(source_path, dest_path)
+    return dest_path
 
 # ---------- Core routes ----------
 @app.post("/veo/i2v")
-def create_video(body: I2VBody):
+def create_video(body: I2VBody, request: Request):
+    client = _get_genai_client(body.gemini_api_key)
     # 1) Chuẩn bị ảnh input (Part)
     image_part = _image_part_from_input(body)
 
@@ -156,7 +162,7 @@ def create_video(body: I2VBody):
     )
 
     # 3) Poll tới khi xong
-    operation = _poll_operation(operation, sleep_sec=8)
+    operation = _poll_operation(client, operation, sleep_sec=8)
 
     resp = getattr(operation, "response", None)
     if not resp or not getattr(resp, "generated_videos", None):
@@ -165,7 +171,7 @@ def create_video(body: I2VBody):
 
     # 4) Tải video Veo (MP4 có audio native từ Veo – nếu không dùng TTS)
     gen_video = operation.response.generated_videos[0]
-    video_bytes = _download_genai_file_to_bytes(gen_video.video)
+    video_bytes = _download_genai_file_to_bytes(client, gen_video.video)
 
     with tempfile.TemporaryDirectory() as td:
         raw_video_path = os.path.join(td, "veo_raw.mp4")
@@ -174,7 +180,6 @@ def create_video(body: I2VBody):
         final_path = raw_video_path  # mặc định
 
         # 5) Nếu có voiceover_text: tạo TTS và ghép audio vào video bằng ffmpeg
-        voice_url = None
         if body.voiceover_text:
             # TTS bằng Gemini 2.5 TTS
             tts_resp = client.models.generate_content(
@@ -224,9 +229,10 @@ def create_video(body: I2VBody):
             )
 
         # 6) Upload GCS + trả JSON
-        bucket = body.gcs_bucket or GCS_BUCKET
-        object_name = f"{body.gcs_prefix or 'veo_i2v'}/veo_{int(time.time())}.mp4"
-        signed_url = _gcs_upload_and_signed_url(final_path, object_name, bucket)
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        local_filename = f"{timestamp_str}.mp4"
+        local_file_path = _persist_local_copy(final_path, local_filename, target_dir=VIDEOS_DIR)
+        local_video_url = str(request.url_for("videos", path=local_filename))
 
         return {
             "status": "ok",
@@ -237,19 +243,16 @@ def create_video(body: I2VBody):
             "person_generation": body.person_generation,
             "negative_prompt": body.negative_prompt,
             "voiceover_injected": bool(body.voiceover_text),
-            "gcs_bucket": bucket,
-            "gcs_object": object_name,
-            "video_url": signed_url
+            "video_url": local_video_url,
+            "local_file": local_file_path,
         }
 
 # ---------- Merge multiple videos by URL ----------
 class MergeVideosBody(BaseModel):
     video_urls: list[HttpUrl]
-    gcs_bucket: Optional[str] = None              # override default bucket nếu muốn
-    gcs_prefix: Optional[str] = "merged_videos"   # folder prefix trên GCS
 
 @app.post("/merge_videos")
-def merge_videos(body: MergeVideosBody):
+def merge_videos(body: MergeVideosBody, request: Request):
     if not body.video_urls:
         raise HTTPException(400, "Bạn phải truyền ít nhất 1 phần tử trong video_urls")
 
@@ -290,20 +293,19 @@ def merge_videos(body: MergeVideosBody):
                 .run(quiet=True)
             )
 
-        bucket = body.gcs_bucket or GCS_BUCKET
-        object_name = f"{body.gcs_prefix or 'merged_videos'}/merged_{int(time.time())}.mp4"
-        signed_url = _gcs_upload_and_signed_url(merged_path, object_name, bucket)
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        local_filename = f"merged_{timestamp_str}.mp4"
+        local_file_path = _persist_local_copy(merged_path, local_filename, target_dir=VIDEOS_DIR)
+        local_video_url = str(request.url_for("videos", path=local_filename))
 
         return {
             "status": "ok",
             "input_count": len(body.video_urls),
-            "gcs_bucket": bucket,
-            "gcs_object": object_name,
-            "video_url": signed_url,
+            "video_url": local_video_url,
+            "local_file": local_file_path,
         }
 
 
 @app.get("/")
 def root():
     return {"hello": "Veo3 i2v API – ready"}
-

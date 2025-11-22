@@ -1,0 +1,13 @@
+version: "3.9"
+
+services:
+  veoapi:
+    build: .
+    container_name: veoapi
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    volumes:
+      - .:/app
