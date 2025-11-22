@@ -2,7 +2,9 @@ version: "3.9"
 
 services:
   veoapi:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: veoapi
     restart: unless-stopped
     ports:
