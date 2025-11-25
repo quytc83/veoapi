@@ -173,6 +173,11 @@ def _download_to_path(url: str, dest_path: str, timeout: int = 120):
 def _audio_duration_seconds(audio_path: str, require_mp3_wav: bool = False) -> float:
     try:
         probe = ffmpeg.probe(audio_path)
+    except FileNotFoundError:
+        raise HTTPException(
+            500,
+            "Không tìm thấy ffprobe. Cài đặt ffmpeg/ffprobe (ví dụ: brew install ffmpeg) rồi chạy lại.",
+        )
     except ffmpeg.Error as e:
         raise HTTPException(400, f"Không đọc được metadata audio: {e}")
 
