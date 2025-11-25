@@ -6,7 +6,8 @@ import base64
 import tempfile
 import shutil
 import requests
-from typing import Optional
+from urllib.parse import urlparse
+from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
@@ -49,6 +50,13 @@ class I2VBody(BaseModel):
     tts_sample_rate: int = 24000                  # PCM 24kHz theo hướng dẫn
 
     gemini_api_key: Optional[str] = None          # cho phép truyền API key mỗi request
+
+
+class AudioSlideshowBody(BaseModel):
+    audio_url: HttpUrl
+    img_urls: List[HttpUrl]
+    seconds_per_image: float = 3.0
+    frame_rate: int = 30
 
 
 # ---------- Helpers ----------
@@ -137,6 +145,97 @@ def _persist_local_copy(source_path: str, target_name: str, target_dir: Optional
     dest_path = os.path.join(dest_dir, base_name)
     shutil.copyfile(source_path, dest_path)
     return dest_path
+
+
+def _parse_resolution(resolution: str) -> tuple[int, int]:
+    try:
+        width_str, height_str = resolution.lower().split("x")
+        width = int(width_str)
+        height = int(height_str)
+        if width <= 0 or height <= 0:
+            raise ValueError
+        return width, height
+    except ValueError:
+        raise HTTPException(400, "resolution phải có dạng WIDTHxHEIGHT, ví dụ 1280x720")
+
+
+def _download_to_path(url: str, dest_path: str, timeout: int = 120):
+    try:
+        resp = requests.get(url, timeout=timeout)
+    except Exception as e:
+        raise HTTPException(400, f"Không tải được {url}: {e}")
+    if resp.status_code != 200:
+        raise HTTPException(400, f"Không tải được {url} (status={resp.status_code})")
+    with open(dest_path, "wb") as f:
+        f.write(resp.content)
+
+
+def _audio_duration_seconds(audio_path: str, require_mp3_wav: bool = False) -> float:
+    try:
+        probe = ffmpeg.probe(audio_path)
+    except ffmpeg.Error as e:
+        raise HTTPException(400, f"Không đọc được metadata audio: {e}")
+
+    if require_mp3_wav:
+        format_name = (probe.get("format", {}).get("format_name") or "").lower()
+        if not any(fmt in format_name for fmt in ("mp3", "wav")):
+            raise HTTPException(400, "Audio chỉ hỗ trợ đuôi mp3 hoặc wav.")
+
+    duration_candidates = []
+    if "format" in probe and "duration" in probe["format"]:
+        duration_candidates.append(probe["format"]["duration"])
+    for stream in probe.get("streams", []):
+        if stream.get("codec_type") == "audio" and "duration" in stream:
+            duration_candidates.append(stream["duration"])
+
+    for duration_str in duration_candidates:
+        try:
+            duration = float(duration_str)
+            if duration > 0:
+                return duration
+        except (TypeError, ValueError):
+            continue
+
+    raise HTTPException(400, "Không xác định được độ dài file audio.")
+
+
+def _build_slideshow_cycle(image_paths: List[str], seconds_per_image: float, frame_rate: int,
+                           resolution: str, dest_path: str):
+    if not image_paths:
+        raise HTTPException(400, "img_urls không được rỗng.")
+    if seconds_per_image <= 0:
+        raise HTTPException(400, "seconds_per_image phải > 0.")
+    if frame_rate <= 0:
+        raise HTTPException(400, "frame_rate phải > 0.")
+
+    width, height = _parse_resolution(resolution)
+    streams = []
+    for img_path in image_paths:
+        stream = (
+            ffmpeg
+            .input(img_path, loop=1, framerate=frame_rate, t=str(seconds_per_image))
+            .filter("scale", width, height, force_original_aspect_ratio="decrease")
+            .filter("pad", width, height, "(ow-iw)/2", "(oh-ih)/2", color="black")
+            .filter("setsar", "1")
+        )
+        streams.append(stream)
+
+    concatenated = ffmpeg.concat(*streams, v=1, a=0)
+    (
+        ffmpeg
+        .output(concatenated, dest_path, r=frame_rate, pix_fmt="yuv420p", vcodec="libx264")
+        .overwrite_output()
+        .run(quiet=True)
+    )
+
+def _aspect_ratio_from_resolution(resolution: str) -> str:
+    width, height = _parse_resolution(resolution)
+    if width * 9 == height * 16:
+        return "16:9"
+    if width * 16 == height * 9:
+        return "9:16"
+    raise HTTPException(400, "resolution phải theo tỷ lệ 16:9 hoặc 9:16.")
+
 
 # ---------- Core routes ----------
 @app.post("/veo/i2v")
@@ -243,6 +342,81 @@ def create_video(body: I2VBody, request: Request):
             "person_generation": body.person_generation,
             "negative_prompt": body.negative_prompt,
             "voiceover_injected": bool(body.voiceover_text),
+            "video_url": local_video_url,
+            "local_file": local_file_path,
+        }
+
+
+@app.post("/audio-slideshow")
+def create_audio_slideshow(
+    body: AudioSlideshowBody,
+    request: Request,
+    resolution: str = "1280x720",
+):
+    if not body.img_urls:
+        raise HTTPException(400, "img_urls phải có ít nhất 1 phần tử.")
+
+    with tempfile.TemporaryDirectory() as td:
+        aspect_ratio = _aspect_ratio_from_resolution(resolution)
+        # Download audio
+        parsed_audio = urlparse(str(body.audio_url))
+        audio_ext = os.path.splitext(parsed_audio.path)[1] or ".audio"
+        audio_path = os.path.join(td, f"audio{audio_ext}")
+        _download_to_path(str(body.audio_url), audio_path, timeout=300)
+        audio_duration = _audio_duration_seconds(audio_path, require_mp3_wav=True)
+
+        # Download images
+        image_paths: List[str] = []
+        for idx, img_url in enumerate(body.img_urls):
+            parsed_img = urlparse(str(img_url))
+            img_ext = os.path.splitext(parsed_img.path)[1] or ".png"
+            img_path = os.path.join(td, f"img_{idx:03d}{img_ext}")
+            _download_to_path(str(img_url), img_path, timeout=120)
+            image_paths.append(img_path)
+
+        # Build one slideshow cycle video
+        cycle_path = os.path.join(td, "cycle.mp4")
+        _build_slideshow_cycle(
+            image_paths=image_paths,
+            seconds_per_image=body.seconds_per_image,
+            frame_rate=body.frame_rate,
+            resolution=resolution,
+            dest_path=cycle_path,
+        )
+
+        # Loop slideshow video and align with audio length
+        final_temp_path = os.path.join(td, "slideshow.mp4")
+        slideshow_video = ffmpeg.input(cycle_path, stream_loop=-1)
+        audio_stream = ffmpeg.input(audio_path)
+        (
+            ffmpeg
+            .output(
+                slideshow_video.video,
+                audio_stream.audio,
+                final_temp_path,
+                vcodec="libx264",
+                acodec="aac",
+                audio_bitrate="192k",
+                pix_fmt="yuv420p",
+                shortest=None,
+            )
+            .overwrite_output()
+            .run(quiet=True)
+        )
+
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        local_filename = f"audio_slideshow_{timestamp_str}.mp4"
+        local_file_path = _persist_local_copy(final_temp_path, local_filename, target_dir=VIDEOS_DIR)
+        local_video_url = str(request.url_for("videos", path=local_filename))
+
+        return {
+            "status": "ok",
+            "audio_duration": audio_duration,
+            "image_count": len(body.img_urls),
+            "seconds_per_image": body.seconds_per_image,
+            "frame_rate": body.frame_rate,
+            "aspect_ratio": aspect_ratio,
+            "resolution": resolution,
             "video_url": local_video_url,
             "local_file": local_file_path,
         }
