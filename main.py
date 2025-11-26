@@ -61,6 +61,13 @@ class AudioSlideshowBody(BaseModel):
     frame_rate: int = 30
 
 
+class VideoVoiceoverBody(BaseModel):
+    video_url: HttpUrl
+    audio_url: HttpUrl
+    original_audio_volume: float = 0.2
+    voiceover_volume: float = 1.0
+
+
 # ---------- Helpers ----------
 def _fetch_image_bytes(image_url: str) -> bytes:
     resp = requests.get(image_url, timeout=60)
@@ -266,7 +273,7 @@ def _concat_videos(input_paths: List[str], output_path: str):
     os.remove(list_path)
 
 
-def _find_existing_video_path(url_str: str) -> Optional[str]:
+def _find_existing_media_path(url_str: str) -> Optional[str]:
     parsed = urlparse(url_str)
     base_name = os.path.basename(parsed.path)
     if not base_name:
@@ -275,6 +282,189 @@ def _find_existing_video_path(url_str: str) -> Optional[str]:
     if os.path.isfile(candidate):
         return candidate
     return None
+
+
+def _video_metadata(video_path: str) -> tuple[float, bool]:
+    try:
+        probe = ffmpeg.probe(video_path)
+    except FileNotFoundError:
+        raise HTTPException(
+            500,
+            "Không tìm thấy ffprobe. Cài đặt ffmpeg/ffprobe (ví dụ: brew install ffmpeg) rồi chạy lại.",
+        )
+    except ffmpeg.Error as e:
+        raise HTTPException(400, f"Không đọc được metadata video: {e}")
+
+    has_audio = any(stream.get("codec_type") == "audio" for stream in probe.get("streams", []))
+
+    duration_candidates = []
+    if "format" in probe and "duration" in probe["format"]:
+        duration_candidates.append(probe["format"]["duration"])
+    for stream in probe.get("streams", []):
+        if "duration" in stream:
+            duration_candidates.append(stream["duration"])
+
+    for duration_str in duration_candidates:
+        try:
+            duration = float(duration_str)
+            if duration > 0:
+                return duration, has_audio
+        except (TypeError, ValueError):
+            continue
+
+    raise HTTPException(400, "Không xác định được độ dài video.")
+
+
+def _apply_atempo_chain(stream, factor: float):
+    if factor <= 0:
+        raise HTTPException(400, "atempo factor phải > 0.")
+    if abs(factor - 1.0) < 1e-6:
+        return stream
+
+    factors = []
+    remaining = factor
+    while remaining < 0.5:
+        factors.append(0.5)
+        remaining /= 0.5
+    while remaining > 2.0:
+        factors.append(2.0)
+        remaining /= 2.0
+    factors.append(remaining)
+
+    for f in factors:
+        if abs(f - 1.0) < 1e-6:
+            continue
+        stream = stream.filter("atempo", f)
+    return stream
+
+
+def _apply_transition_effect(src_path: str, dest_path: str, fade_duration: float,
+                             is_first: bool, is_last: bool, clip_duration: float,
+                             has_audio: bool, apply_blur: bool):
+    if fade_duration <= 0 and not apply_blur:
+        shutil.copyfile(src_path, dest_path)
+        return
+
+    safe_fade = min(fade_duration, max(clip_duration / 2.0 - 0.01, 0))
+    if fade_duration > 0 and safe_fade <= 0 and not apply_blur:
+        shutil.copyfile(src_path, dest_path)
+        return
+
+    inp = ffmpeg.input(src_path)
+    video_stream = inp.video
+    if fade_duration > 0 and safe_fade > 0:
+        if not is_first:
+            video_stream = video_stream.filter("fade", type="in", start_time=0, duration=safe_fade)
+        if not is_last:
+            start = max(clip_duration - safe_fade, 0)
+            video_stream = video_stream.filter("fade", type="out", start_time=start, duration=safe_fade)
+
+    if apply_blur:
+        video_stream = video_stream.filter("tblend", all_mode="average").filter("tblend", all_mode="average")
+
+    if has_audio:
+        audio_stream = inp.audio
+        if fade_duration > 0 and safe_fade > 0:
+            if not is_first:
+                audio_stream = audio_stream.filter("afade", type="in", start_time=0, duration=safe_fade)
+            if not is_last:
+                start = max(clip_duration - safe_fade, 0)
+                audio_stream = audio_stream.filter("afade", type="out", start_time=start, duration=safe_fade)
+    else:
+        audio_stream = None
+
+    out = ffmpeg.output(
+        *( [video_stream, audio_stream] if audio_stream else [video_stream] ),
+        dest_path,
+        vcodec="libx264",
+        pix_fmt="yuv420p",
+        **({"acodec": "aac", "audio_bitrate": "192k"} if audio_stream else {})
+    )
+    out = out.overwrite_output()
+    out.run(quiet=True)
+
+
+def _build_audio_stream(input_handle, has_audio: bool, duration: float):
+    if has_audio:
+        return input_handle.audio
+    return ffmpeg.input(
+        "anullsrc=r=48000:cl=stereo",
+        f="lavfi",
+        t=max(duration, 0.1)
+    ).audio
+
+
+def _crossfade_two_videos(path_a: str, meta_a: tuple[float, bool],
+                          path_b: str, meta_b: tuple[float, bool],
+                          transition_seconds: float, output_path: str):
+    duration_a, has_audio_a = meta_a
+    duration_b, has_audio_b = meta_b
+    if duration_a <= 0 or duration_b <= 0:
+        _concat_videos([path_a, path_b], output_path)
+        return
+
+    fade_dur = min(transition_seconds, duration_a, duration_b)
+    if fade_dur <= 0:
+        _concat_videos([path_a, path_b], output_path)
+        return
+
+    offset = max(duration_a - fade_dur, 0)
+    in_a = ffmpeg.input(path_a)
+    in_b = ffmpeg.input(path_b)
+
+    video_stream = ffmpeg.filter(
+        [in_a.video, in_b.video],
+        "xfade",
+        transition="fade",
+        duration=fade_dur,
+        offset=offset,
+    )
+
+    audio_stream = ffmpeg.filter(
+        [
+            _build_audio_stream(in_a, has_audio_a, duration_a),
+            _build_audio_stream(in_b, has_audio_b, duration_b),
+        ],
+        "acrossfade",
+        d=fade_dur,
+    )
+
+    (
+        ffmpeg
+        .output(
+            video_stream,
+            audio_stream,
+            output_path,
+            vcodec="libx264",
+            acodec="aac",
+            audio_bitrate="192k",
+            pix_fmt="yuv420p",
+        )
+        .overwrite_output()
+        .run(quiet=True)
+    )
+
+
+def _merge_with_crossfade(part_paths: List[str], clip_meta: List[tuple[float, bool]],
+                          transition_seconds: float, tmp_dir: str) -> str:
+    if len(part_paths) == 1:
+        return part_paths[0]
+
+    current_path = part_paths[0]
+    current_meta = clip_meta[0]
+
+    for idx in range(1, len(part_paths)):
+        next_path = part_paths[idx]
+        next_meta = clip_meta[idx]
+        output_path = os.path.join(tmp_dir, f"crossfade_{idx:03d}.mp4")
+        _crossfade_two_videos(current_path, current_meta, next_path, next_meta, transition_seconds, output_path)
+        fade_dur = min(transition_seconds, current_meta[0], next_meta[0])
+        current_duration = current_meta[0] + next_meta[0] - fade_dur
+        current_has_audio = current_meta[1] or next_meta[1]
+        current_meta = (current_duration, current_has_audio)
+        current_path = output_path
+
+    return current_path
 
 
 # ---------- Core routes ----------
@@ -461,9 +651,100 @@ def create_audio_slideshow(
             "local_file": local_file_path,
         }
 
+
+@app.post("/video/voiceover")
+def add_voiceover(body: VideoVoiceoverBody, request: Request):
+    with tempfile.TemporaryDirectory() as td:
+        video_path = _find_existing_media_path(str(body.video_url))
+        if not video_path:
+            video_path = os.path.join(td, "input_video.mp4")
+            _download_to_path(str(body.video_url), video_path, timeout=600)
+
+        audio_path = _find_existing_media_path(str(body.audio_url))
+        if not audio_path:
+            audio_ext = os.path.splitext(urlparse(str(body.audio_url)).path)[1] or ".audio"
+            audio_path = os.path.join(td, f"voiceover{audio_ext}")
+            _download_to_path(str(body.audio_url), audio_path, timeout=300)
+
+        audio_duration = _audio_duration_seconds(audio_path, require_mp3_wav=True)
+        video_duration, has_original_audio = _video_metadata(video_path)
+        final_duration = max(audio_duration, video_duration)
+        if video_duration <= 0:
+            raise HTTPException(400, "Video không có độ dài hợp lệ.")
+
+        video_input = ffmpeg.input(video_path)
+        voice_input = ffmpeg.input(audio_path)
+
+        video_stream = video_input.video
+        if audio_duration > video_duration:
+            stretch_ratio = audio_duration / video_duration
+            video_stream = video_stream.filter("setpts", f"{stretch_ratio}*PTS")
+        elif video_duration < final_duration:
+            pad_dur = final_duration - video_duration
+            video_stream = video_stream.filter("tpad", start_duration=0, stop_mode="clone", stop_duration=pad_dur)
+
+        voice_audio = voice_input.audio
+        if audio_duration < final_duration:
+            pad_dur = final_duration - audio_duration
+            voice_audio = voice_audio.filter("apad", pad_dur=pad_dur)
+        voice_audio = voice_audio.filter("volume", body.voiceover_volume)
+
+        audio_streams = [voice_audio]
+        if has_original_audio:
+            original_audio = video_input.audio
+            if audio_duration > video_duration:
+                tempo_factor = video_duration / audio_duration
+                original_audio = _apply_atempo_chain(original_audio, tempo_factor)
+            elif video_duration < final_duration:
+                pad_dur = final_duration - video_duration
+                original_audio = original_audio.filter("apad", pad_dur=pad_dur)
+            original_audio = original_audio.filter("volume", body.original_audio_volume)
+            audio_streams.append(original_audio)
+
+        if len(audio_streams) == 1:
+            mixed_audio = audio_streams[0]
+        else:
+            mixed_audio = ffmpeg.filter(audio_streams, "amix", inputs=len(audio_streams), dropout_transition=0)
+
+        final_temp_path = os.path.join(td, "voiceover_video.mp4")
+        (
+            ffmpeg
+            .output(
+                video_stream,
+                mixed_audio,
+                final_temp_path,
+                vcodec="libx264",
+                acodec="aac",
+                audio_bitrate="192k",
+                pix_fmt="yuv420p",
+                shortest=None,
+            )
+            .overwrite_output()
+            .run(quiet=True)
+        )
+
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        local_filename = f"voiceover_{timestamp_str}.mp4"
+        local_file_path = _persist_local_copy(final_temp_path, local_filename, target_dir=VIDEOS_DIR)
+        local_video_url = str(request.url_for("videos", path=local_filename))
+
+        return {
+            "status": "ok",
+            "video_duration": video_duration,
+            "audio_duration": audio_duration,
+            "final_duration": final_duration,
+            "video_url": local_video_url,
+            "local_file": local_file_path,
+            "original_audio_included": has_original_audio,
+            "original_audio_volume": body.original_audio_volume,
+            "voiceover_volume": body.voiceover_volume,
+        }
+
 # ---------- Merge multiple videos by URL ----------
 class MergeVideosBody(BaseModel):
     video_urls: list[HttpUrl]
+    transition_seconds: float = 0.0
+    motion_blur: bool = False
 
 @app.post("/merge_videos")
 def merge_videos(body: MergeVideosBody, request: Request):
@@ -474,7 +755,7 @@ def merge_videos(body: MergeVideosBody, request: Request):
         max_workers = min(4, len(body.video_urls))
 
         def _download_job(idx: int, url_str: str):
-            local_path = _find_existing_video_path(url_str)
+            local_path = _find_existing_media_path(url_str)
             if local_path:
                 return idx, local_path
             part_path = os.path.join(td, f"part_{idx:03d}.mp4")
@@ -495,25 +776,52 @@ def merge_videos(body: MergeVideosBody, request: Request):
         if not part_paths:
             raise HTTPException(400, "Không tải được video nào.")
 
-        current_paths = part_paths
-        level = 0
-        while len(current_paths) > 1:
-            next_paths: List[str] = []
-            for chunk_idx in range(0, len(current_paths), MERGE_CHUNK_SIZE):
-                chunk = current_paths[chunk_idx: chunk_idx + MERGE_CHUNK_SIZE]
-                if len(chunk) == 1:
-                    next_paths.append(chunk[0])
-                    continue
-                chunk_output = os.path.join(
-                    td, f"merged_l{level}_{chunk_idx // MERGE_CHUNK_SIZE:03d}.mp4"
+        clip_meta = []
+        for path in part_paths:
+            duration, has_audio = _video_metadata(path)
+            clip_meta.append((duration, has_audio))
+
+        preprocess_fade = 0.0 if body.transition_seconds > 0 else max(min(body.transition_seconds, 0.5), 0.0)
+        if preprocess_fade > 0 or body.motion_blur:
+            transitioned_paths = []
+            for idx, path in enumerate(part_paths):
+                duration, has_audio = clip_meta[idx]
+                temp_path = os.path.join(td, f"transition_{idx:03d}.mp4")
+                _apply_transition_effect(
+                    src_path=path,
+                    dest_path=temp_path,
+                    fade_duration=preprocess_fade,
+                    is_first=(idx == 0),
+                    is_last=(idx == len(part_paths) - 1),
+                    clip_duration=duration,
+                    has_audio=has_audio,
+                    apply_blur=body.motion_blur,
                 )
-                _concat_videos(chunk, chunk_output)
-                next_paths.append(chunk_output)
-            current_paths = next_paths
-            level += 1
+                transitioned_paths.append(temp_path)
+            part_paths = transitioned_paths
+            # motion blur/fade processing doesn't change duration; keep metadata for reference
 
-        merged_path = current_paths[0]
+        if body.transition_seconds > 0:
+            merged_path = _merge_with_crossfade(part_paths, clip_meta, body.transition_seconds, td)
+        else:
+            current_paths = part_paths
+            level = 0
+            while len(current_paths) > 1:
+                next_paths: List[str] = []
+                for chunk_idx in range(0, len(current_paths), MERGE_CHUNK_SIZE):
+                    chunk = current_paths[chunk_idx: chunk_idx + MERGE_CHUNK_SIZE]
+                    if len(chunk) == 1:
+                        next_paths.append(chunk[0])
+                        continue
+                    chunk_output = os.path.join(
+                        td, f"merged_l{level}_{chunk_idx // MERGE_CHUNK_SIZE:03d}.mp4"
+                    )
+                    _concat_videos(chunk, chunk_output)
+                    next_paths.append(chunk_output)
+                current_paths = next_paths
+                level += 1
 
+            merged_path = current_paths[0]
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         local_filename = f"merged_{timestamp_str}.mp4"
         local_file_path = _persist_local_copy(merged_path, local_filename, target_dir=VIDEOS_DIR)
