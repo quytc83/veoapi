@@ -1,13 +1,14 @@
 import os
-import io
 import time
 from datetime import datetime
 import base64
 import tempfile
 import shutil
+import threading
+import uuid
 import requests
 from urllib.parse import urlparse
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from fastapi import FastAPI, HTTPException, Request
@@ -28,6 +29,10 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 VIDEOS_DIR = os.path.join(SCRIPT_DIR, "videos")
 os.makedirs(VIDEOS_DIR, exist_ok=True)
 MERGE_CHUNK_SIZE = 5
+MERGE_DOWNLOAD_TIMEOUT = 600
+MERGE_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+MERGE_JOBS: Dict[str, Dict[str, Any]] = {}
+MERGE_JOBS_LOCK = threading.Lock()
 
 app = FastAPI(title="Veo3 Image-to-Video API (i2v+TTS)")
 app.mount("/videos", StaticFiles(directory=VIDEOS_DIR), name="videos")
@@ -746,27 +751,60 @@ class MergeVideosBody(BaseModel):
     transition_seconds: float = 0.0
     motion_blur: bool = False
 
-@app.post("/merge_videos")
-def merge_videos(body: MergeVideosBody, request: Request):
+
+@app.post("/merge_videos_job")
+def create_merge_videos_job(body: MergeVideosBody, request: Request):
     if not body.video_urls:
         raise HTTPException(400, "Bạn phải truyền ít nhất 1 phần tử trong video_urls")
 
+    job_id = str(uuid.uuid4())
+    now = datetime.utcnow()
+    with MERGE_JOBS_LOCK:
+        MERGE_JOBS[job_id] = {
+            "status": "pending",
+            "created_at": now,
+            "updated_at": now,
+            "result": None,
+            "error": None,
+        }
+
+    MERGE_JOB_EXECUTOR.submit(
+        _run_merge_video_job,
+        job_id,
+        [str(url) for url in body.video_urls],
+        body.transition_seconds,
+        body.motion_blur,
+        str(request.base_url),
+    )
+
+    return {"job_id": job_id, "status": "pending"}
+
+
+@app.get("/merge_videos_job/{job_id}")
+def get_merge_videos_job(job_id: str):
+    return _serialize_job(job_id)
+
+
+def _execute_merge_videos(video_urls: List[str], transition_seconds: float, motion_blur: bool) -> tuple[str, str, int]:
+    if not video_urls:
+        raise HTTPException(400, "Bạn phải truyền ít nhất 1 phần tử trong video_urls")
+
     with tempfile.TemporaryDirectory() as td:
-        max_workers = min(4, len(body.video_urls))
+        max_workers = min(4, len(video_urls))
 
         def _download_job(idx: int, url_str: str):
             local_path = _find_existing_media_path(url_str)
             if local_path:
                 return idx, local_path
             part_path = os.path.join(td, f"part_{idx:03d}.mp4")
-            _download_to_path(url_str, part_path, timeout=300)
+            _download_to_path(url_str, part_path, timeout=MERGE_DOWNLOAD_TIMEOUT)
             return idx, part_path
 
-        ordered_parts: List[Optional[str]] = [None] * len(body.video_urls)
+        ordered_parts: List[Optional[str]] = [None] * len(video_urls)
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = [
-                pool.submit(_download_job, idx, str(url))
-                for idx, url in enumerate(body.video_urls)
+                pool.submit(_download_job, idx, url_str)
+                for idx, url_str in enumerate(video_urls)
             ]
             for future in as_completed(futures):
                 idx, path = future.result()
@@ -781,8 +819,8 @@ def merge_videos(body: MergeVideosBody, request: Request):
             duration, has_audio = _video_metadata(path)
             clip_meta.append((duration, has_audio))
 
-        preprocess_fade = 0.0 if body.transition_seconds > 0 else max(min(body.transition_seconds, 0.5), 0.0)
-        if preprocess_fade > 0 or body.motion_blur:
+        preprocess_fade = 0.0 if transition_seconds > 0 else max(min(transition_seconds, 0.5), 0.0)
+        if preprocess_fade > 0 or motion_blur:
             transitioned_paths = []
             for idx, path in enumerate(part_paths):
                 duration, has_audio = clip_meta[idx]
@@ -795,14 +833,13 @@ def merge_videos(body: MergeVideosBody, request: Request):
                     is_last=(idx == len(part_paths) - 1),
                     clip_duration=duration,
                     has_audio=has_audio,
-                    apply_blur=body.motion_blur,
+                    apply_blur=motion_blur,
                 )
                 transitioned_paths.append(temp_path)
             part_paths = transitioned_paths
-            # motion blur/fade processing doesn't change duration; keep metadata for reference
 
-        if body.transition_seconds > 0:
-            merged_path = _merge_with_crossfade(part_paths, clip_meta, body.transition_seconds, td)
+        if transition_seconds > 0:
+            merged_path = _merge_with_crossfade(part_paths, clip_meta, transition_seconds, td)
         else:
             current_paths = part_paths
             level = 0
@@ -822,17 +859,91 @@ def merge_videos(body: MergeVideosBody, request: Request):
                 level += 1
 
             merged_path = current_paths[0]
+
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         local_filename = f"merged_{timestamp_str}.mp4"
         local_file_path = _persist_local_copy(merged_path, local_filename, target_dir=VIDEOS_DIR)
-        local_video_url = str(request.url_for("videos", path=local_filename))
 
-        return {
+    return local_file_path, local_filename, len(video_urls)
+
+
+def _build_video_url(filename: str, base_url: str) -> str:
+    relative_path = app.url_path_for("videos", path=filename)
+    prefix = base_url.rstrip("/")
+    if not prefix:
+        return relative_path
+    if not relative_path.startswith("/"):
+        relative_path = f"/{relative_path}"
+    return f"{prefix}{relative_path}"
+
+
+def _set_job_state(job_id: str, status: str, *, result: Optional[Dict[str, Any]] = None,
+                   error: Optional[Dict[str, Any]] = None):
+    with MERGE_JOBS_LOCK:
+        job = MERGE_JOBS.get(job_id)
+        if not job:
+            return
+        job["status"] = status
+        job["updated_at"] = datetime.utcnow()
+        job["result"] = result
+        job["error"] = error
+
+
+def _run_merge_video_job(job_id: str, video_urls: List[str], transition_seconds: float,
+                         motion_blur: bool, base_url: str):
+    try:
+        _set_job_state(job_id, "running")
+        local_file_path, local_filename, input_count = _execute_merge_videos(
+            video_urls, transition_seconds, motion_blur
+        )
+        result_payload = {
             "status": "ok",
-            "input_count": len(body.video_urls),
-            "video_url": local_video_url,
+            "input_count": input_count,
             "local_file": local_file_path,
+            "video_url": _build_video_url(local_filename, base_url),
         }
+        _set_job_state(job_id, "completed", result=result_payload, error=None)
+    except HTTPException as exc:
+        error_payload = {"status_code": exc.status_code, "detail": exc.detail}
+        _set_job_state(job_id, "failed", error=error_payload)
+    except Exception as exc:
+        error_payload = {"status_code": 500, "detail": str(exc)}
+        _set_job_state(job_id, "failed", error=error_payload)
+
+
+def _serialize_job(job_id: str) -> Dict[str, Any]:
+    with MERGE_JOBS_LOCK:
+        job = MERGE_JOBS.get(job_id)
+        if not job:
+            raise HTTPException(404, f"Job {job_id} không tồn tại")
+        response: Dict[str, Any] = {
+            "job_id": job_id,
+            "status": job["status"],
+            "created_at": job["created_at"].isoformat(),
+            "updated_at": job["updated_at"].isoformat(),
+        }
+        if job.get("result"):
+            response["result"] = job["result"]
+        if job.get("error"):
+            response["error"] = job["error"]
+        return response
+
+
+@app.post("/merge_videos")
+def merge_videos(body: MergeVideosBody, request: Request):
+    local_file_path, local_filename, input_count = _execute_merge_videos(
+        [str(url) for url in body.video_urls],
+        body.transition_seconds,
+        body.motion_blur,
+    )
+    local_video_url = str(request.url_for("videos", path=local_filename))
+
+    return {
+        "status": "ok",
+        "input_count": input_count,
+        "video_url": local_video_url,
+        "local_file": local_file_path,
+    }
 
 
 @app.get("/")
