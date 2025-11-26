@@ -266,6 +266,17 @@ def _concat_videos(input_paths: List[str], output_path: str):
     os.remove(list_path)
 
 
+def _find_existing_video_path(url_str: str) -> Optional[str]:
+    parsed = urlparse(url_str)
+    base_name = os.path.basename(parsed.path)
+    if not base_name:
+        return None
+    candidate = os.path.join(VIDEOS_DIR, base_name)
+    if os.path.isfile(candidate):
+        return candidate
+    return None
+
+
 # ---------- Core routes ----------
 @app.post("/veo/i2v")
 def create_video(body: I2VBody, request: Request):
@@ -463,6 +474,9 @@ def merge_videos(body: MergeVideosBody, request: Request):
         max_workers = min(4, len(body.video_urls))
 
         def _download_job(idx: int, url_str: str):
+            local_path = _find_existing_video_path(url_str)
+            if local_path:
+                return idx, local_path
             part_path = os.path.join(td, f"part_{idx:03d}.mp4")
             _download_to_path(url_str, part_path, timeout=300)
             return idx, part_path
