@@ -8,6 +8,7 @@ import shutil
 import requests
 from urllib.parse import urlparse
 from typing import Optional, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
@@ -26,6 +27,7 @@ DEFAULT_GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 VIDEOS_DIR = os.path.join(SCRIPT_DIR, "videos")
 os.makedirs(VIDEOS_DIR, exist_ok=True)
+MERGE_CHUNK_SIZE = 5
 
 app = FastAPI(title="Veo3 Image-to-Video API (i2v+TTS)")
 app.mount("/videos", StaticFiles(directory=VIDEOS_DIR), name="videos")
@@ -242,6 +244,28 @@ def _aspect_ratio_from_resolution(resolution: str) -> str:
     raise HTTPException(400, "resolution phải theo tỷ lệ 16:9 hoặc 9:16.")
 
 
+def _concat_videos(input_paths: List[str], output_path: str):
+    if not input_paths:
+        raise HTTPException(400, "Không có video để merge.")
+    if len(input_paths) == 1:
+        shutil.copyfile(input_paths[0], output_path)
+        return
+
+    list_path = f"{output_path}.txt"
+    with open(list_path, "w", encoding="utf-8") as f:
+        for p in input_paths:
+            f.write(f"file '{p}'\n")
+
+    (
+        ffmpeg
+        .input(list_path, f="concat", safe=0)
+        .output(output_path, vcodec="libx264", acodec="aac", audio_bitrate="192k")
+        .overwrite_output()
+        .run(quiet=True)
+    )
+    os.remove(list_path)
+
+
 # ---------- Core routes ----------
 @app.post("/veo/i2v")
 def create_video(body: I2VBody, request: Request):
@@ -436,41 +460,45 @@ def merge_videos(body: MergeVideosBody, request: Request):
         raise HTTPException(400, "Bạn phải truyền ít nhất 1 phần tử trong video_urls")
 
     with tempfile.TemporaryDirectory() as td:
-        part_paths = []
-        for idx, url in enumerate(body.video_urls):
-            url_str = str(url)
-            try:
-                resp = requests.get(url_str, timeout=300)
-            except Exception as e:
-                raise HTTPException(400, f"Không tải được video_url={url_str}: {e}")
-            if resp.status_code != 200:
-                raise HTTPException(400, f"Không tải được video_url={url_str}, status={resp.status_code}")
+        max_workers = min(4, len(body.video_urls))
 
+        def _download_job(idx: int, url_str: str):
             part_path = os.path.join(td, f"part_{idx:03d}.mp4")
-            with open(part_path, "wb") as f:
-                f.write(resp.content)
-            part_paths.append(part_path)
+            _download_to_path(url_str, part_path, timeout=300)
+            return idx, part_path
 
-        if len(part_paths) == 1:
-            # chỉ 1 video thì khỏi merge, upload luôn
-            merged_path = part_paths[0]
-        else:
-            # Tạo file list cho ffmpeg concat demuxer
-            list_path = os.path.join(td, "inputs.txt")
-            with open(list_path, "w", encoding="utf-8") as f:
-                for p in part_paths:
-                    # đường dẫn tạm không có khoảng trắng nên đơn giản dùng ''
-                    f.write(f"file '{p}'\n")
+        ordered_parts: List[Optional[str]] = [None] * len(body.video_urls)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [
+                pool.submit(_download_job, idx, str(url))
+                for idx, url in enumerate(body.video_urls)
+            ]
+            for future in as_completed(futures):
+                idx, path = future.result()
+                ordered_parts[idx] = path
 
-            merged_path = os.path.join(td, "merged.mp4")
-            (
-                ffmpeg
-                .input(list_path, f="concat", safe=0)
-                # re-encode về H.264 + AAC để hạn chế lỗi khác codec/khung hình
-                .output(merged_path, vcodec="libx264", acodec="aac", audio_bitrate="192k")
-                .overwrite_output()
-                .run(quiet=True)
-            )
+        part_paths = [p for p in ordered_parts if p]
+        if not part_paths:
+            raise HTTPException(400, "Không tải được video nào.")
+
+        current_paths = part_paths
+        level = 0
+        while len(current_paths) > 1:
+            next_paths: List[str] = []
+            for chunk_idx in range(0, len(current_paths), MERGE_CHUNK_SIZE):
+                chunk = current_paths[chunk_idx: chunk_idx + MERGE_CHUNK_SIZE]
+                if len(chunk) == 1:
+                    next_paths.append(chunk[0])
+                    continue
+                chunk_output = os.path.join(
+                    td, f"merged_l{level}_{chunk_idx // MERGE_CHUNK_SIZE:03d}.mp4"
+                )
+                _concat_videos(chunk, chunk_output)
+                next_paths.append(chunk_output)
+            current_paths = next_paths
+            level += 1
+
+        merged_path = current_paths[0]
 
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         local_filename = f"merged_{timestamp_str}.mp4"
