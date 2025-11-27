@@ -35,6 +35,9 @@ curl -X POST "http://0.0.0.0:8080/veo/i2v" \
 JSON
 ```
 
+**Chạy với Veo 2:** chọn `model` là `veo-2.0-generate-001` (hoặc các biến thể Veo 2.x). API tự động loại bỏ
+tham số `resolution` vì Veo 2 không hỗ trợ, nhưng bạn vẫn có thể giữ trường này để đồng bộ payload giữa Veo 2 và Veo 3.
+
 ### 2. Audio Slideshow (`/audio-slideshow`)
 
 Tạo video từ audio và danh sách ảnh, hỗ trợ tham số `resolution=WIDTHxHEIGHT`.
@@ -85,4 +88,25 @@ curl -X POST "http://0.0.0.0:8080/merge_videos" \
        "transition_seconds": 1.5,
        "motion_blur": true
      }'
+```
+
+### 5. Merge Videos Job (`/merge_videos_job`)
+
+Chạy merge ở chế độ nền: POST để tạo job (trả về `job_id`), sau đó GET `/merge_videos_job/{job_id}` để poll trạng thái và lấy `video_url` khi hoàn tất.
+
+```bash
+# Tạo job
+curl -X POST "http://0.0.0.0:8080/merge_videos_job" \
+ -H "Content-Type: application/json" \
+ -d '{
+       "video_urls": [
+         "https://example.com/videos/scene1.mp4",
+         "https://example.com/videos/scene2.mp4"
+       ],
+       "transition_seconds": 0,
+       "motion_blur": false
+     }'
+
+# Poll kết quả (thay <JOB_ID> bằng job_id nhận được ở trên)
+curl "http://0.0.0.0:8080/merge_videos_job/<JOB_ID>"
 ```
