@@ -126,6 +126,16 @@ def _get_genai_client(api_key_override: Optional[str]) -> genai.Client:
     return genai.Client(api_key=api_key)
 
 
+def _model_supports_resolution(model_name: Optional[str]) -> bool:
+    """
+    Veo 2.x không hỗ trợ tham số resolution, nếu truyền sẽ bị 400.
+    Veo 3.x (veo-3.*) hỗ trợ nên vẫn giữ để khách chọn 720p/1080p.
+    """
+    if not model_name:
+        return True
+    return not model_name.startswith("veo-2.")
+
+
 def _poll_operation(client: genai.Client, op, sleep_sec=10):
     # Long-running operation for Veo video generation
     while not op.done:
@@ -480,13 +490,15 @@ def create_video(body: I2VBody, request: Request):
     image_part = _image_part_from_input(body)
 
     # 2) Gọi Veo generate_videos (image-to-video)
-    config = types.GenerateVideosConfig(
+    config_kwargs = dict(
         aspect_ratio=body.aspect_ratio,
-        resolution=body.resolution,
         duration_seconds=str(body.duration_seconds),  # SDK mong "4"|"6"|"8" (string)
         negative_prompt=body.negative_prompt if body.negative_prompt else None,
         person_generation=body.person_generation,     # i2v -> "allow_adult"
     )
+    if _model_supports_resolution(body.model):
+        config_kwargs["resolution"] = body.resolution
+    config = types.GenerateVideosConfig(**config_kwargs)
 
     operation = client.models.generate_videos(
         model=body.model,
