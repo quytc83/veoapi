@@ -74,7 +74,7 @@ curl -X POST "http://0.0.0.0:8080/video/voiceover" \
 
 ### 4. Merge Videos (`/merge_videos`)
 
-API này GHÉP NỐI THẲNG CÁC VIDEO THEO ĐÚNG THỨ TỰ TRONG `video_urls`. Không còn các hiệu ứng cross-fade hay motion blur để đảm bảo ổn định khi chạy trên host thật. Nếu file đã có trong thư mục `videos/` thì API tái sử dụng mà không tải lại.
+API này GHÉP NỐI THẲNG CÁC VIDEO THEO ĐÚNG THỨ TỰ TRONG `video_urls`. Không còn các hiệu ứng cross-fade hay motion blur để đảm bảo ổn định khi chạy trên host thật. Nếu file đã có trong thư mục `videos/` thì API tái sử dụng mà không tải lại. Trước khi ghép, mỗi clip sẽ được đồng bộ lại thời lượng hình/tiếng để không bị hiện tượng tiếng “chạy trước” khung hình.
 
 ```bash
 curl -X POST "http://0.0.0.0:8080/merge_videos" \
@@ -90,7 +90,7 @@ curl -X POST "http://0.0.0.0:8080/merge_videos" \
 
 ### 5. Merge Videos Job (`/merge_videos_job`)
 
-Tạo job chạy nền để ghép video theo THỨ TỰ MẢNG, kết quả cuối cùng cũng chỉ đơn thuần là concat không hiệu ứng. POST để tạo job (trả về `job_id`), sau đó GET `/merge_videos_job/{job_id}` để poll trạng thái và lấy `video_url` khi hoàn tất.
+Tạo job chạy nền để ghép video theo THỨ TỰ MẢNG, kết quả cuối cùng cũng chỉ đơn thuần là concat không hiệu ứng (đã đồng bộ audio để bám sát từng cảnh). POST để tạo job (trả về `job_id`), sau đó GET `/merge_videos_job/{job_id}` để poll trạng thái và lấy `video_url` khi hoàn tất.
 
 ```bash
 # Tạo job ghép 2 video mẫu có sẵn sau khi chạy server (các file nằm trong thư mục videos/).

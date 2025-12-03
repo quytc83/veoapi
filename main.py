@@ -288,6 +288,49 @@ def _concat_videos(input_paths: List[str], output_path: str):
     os.remove(list_path)
 
 
+def _prepare_clip_for_merge(src_path: str, dest_path: str):
+    duration, has_audio, _ = _video_metadata(src_path)
+    if duration <= 0:
+        raise HTTPException(400, f"Video {os.path.basename(src_path)} không có độ dài hợp lệ.")
+
+    inp = ffmpeg.input(src_path)
+    video_stream = (
+        inp.video
+        .filter("trim", duration=duration)
+        .filter("setpts", "PTS-STARTPTS")
+    )
+
+    if has_audio:
+        audio_stream = (
+            inp.audio
+            .filter("apad")
+            .filter("atrim", duration=duration)
+            .filter("asetpts", "PTS-STARTPTS")
+        )
+    else:
+        audio_stream = (
+            ffmpeg
+            .input("anullsrc=r=48000:cl=stereo", f="lavfi")
+            .filter("atrim", duration=duration)
+            .filter("asetpts", "PTS-STARTPTS")
+        )
+
+    (
+        ffmpeg
+        .output(
+            video_stream,
+            audio_stream,
+            dest_path,
+            vcodec="libx264",
+            acodec="aac",
+            audio_bitrate="192k",
+            pix_fmt="yuv420p",
+        )
+        .overwrite_output()
+        .run(quiet=True)
+    )
+
+
 def _find_existing_media_path(url_str: str) -> Optional[str]:
     parsed = urlparse(url_str)
     base_name = os.path.basename(parsed.path)
@@ -299,7 +342,7 @@ def _find_existing_media_path(url_str: str) -> Optional[str]:
     return None
 
 
-def _video_metadata(video_path: str) -> tuple[float, bool]:
+def _video_metadata(video_path: str) -> tuple[float, bool, Optional[float]]:
     try:
         probe = ffmpeg.probe(video_path)
     except FileNotFoundError:
@@ -310,24 +353,43 @@ def _video_metadata(video_path: str) -> tuple[float, bool]:
     except ffmpeg.Error as e:
         raise HTTPException(400, f"Không đọc được metadata video: {e}")
 
-    has_audio = any(stream.get("codec_type") == "audio" for stream in probe.get("streams", []))
+    has_audio = False
 
     duration_candidates = []
+    audio_duration_candidates = []
     if "format" in probe and "duration" in probe["format"]:
         duration_candidates.append(probe["format"]["duration"])
     for stream in probe.get("streams", []):
+        if stream.get("codec_type") == "audio":
+            has_audio = True
+            if "duration" in stream:
+                audio_duration_candidates.append(stream["duration"])
         if "duration" in stream:
             duration_candidates.append(stream["duration"])
 
+    duration = None
     for duration_str in duration_candidates:
         try:
             duration = float(duration_str)
             if duration > 0:
-                return duration, has_audio
+                break
         except (TypeError, ValueError):
             continue
 
-    raise HTTPException(400, "Không xác định được độ dài video.")
+    if duration is None or duration <= 0:
+        raise HTTPException(400, "Không xác định được độ dài video.")
+
+    audio_duration = None
+    for duration_str in audio_duration_candidates:
+        try:
+            candidate = float(duration_str)
+            if candidate > 0:
+                if audio_duration is None or candidate > audio_duration:
+                    audio_duration = candidate
+        except (TypeError, ValueError):
+            continue
+
+    return duration, has_audio, audio_duration
 
 
 def _apply_atempo_chain(stream, factor: float):
@@ -684,7 +746,7 @@ def add_voiceover(body: VideoVoiceoverBody, request: Request):
             _download_to_path(str(body.audio_url), audio_path, timeout=300)
 
         audio_duration = _audio_duration_seconds(audio_path, require_mp3_wav=True)
-        video_duration, has_original_audio = _video_metadata(video_path)
+        video_duration, has_original_audio, _ = _video_metadata(video_path)
         final_duration = max(audio_duration, video_duration)
         if video_duration <= 0:
             raise HTTPException(400, "Video không có độ dài hợp lệ.")
@@ -829,10 +891,12 @@ def _execute_merge_videos(video_urls: List[str], transition_seconds: float, moti
         if not part_paths:
             raise HTTPException(400, "Không tải được video nào.")
 
-        for path in part_paths:
-            duration, _ = _video_metadata(path)
-            if duration <= 0:
-                raise HTTPException(400, f"Video {os.path.basename(path)} không có độ dài hợp lệ.")
+        normalized_paths: List[str] = []
+        for idx, path in enumerate(part_paths):
+            normalized_path = os.path.join(td, f"normalized_{idx:03d}.mp4")
+            _prepare_clip_for_merge(path, normalized_path)
+            normalized_paths.append(normalized_path)
+        part_paths = normalized_paths
 
         current_paths = part_paths
         level = 0
