@@ -801,6 +801,9 @@ def _execute_merge_videos(video_urls: List[str], transition_seconds: float, moti
     if not video_urls:
         raise HTTPException(400, "Bạn phải truyền ít nhất 1 phần tử trong video_urls")
 
+    # transition_seconds/motion_blur are intentionally ignored to keep the merge logic simple/stable
+    _ = (transition_seconds, motion_blur)
+
     with tempfile.TemporaryDirectory() as td:
         max_workers = min(4, len(video_urls))
 
@@ -826,51 +829,29 @@ def _execute_merge_videos(video_urls: List[str], transition_seconds: float, moti
         if not part_paths:
             raise HTTPException(400, "Không tải được video nào.")
 
-        clip_meta = []
         for path in part_paths:
-            duration, has_audio = _video_metadata(path)
-            clip_meta.append((duration, has_audio))
+            duration, _ = _video_metadata(path)
+            if duration <= 0:
+                raise HTTPException(400, f"Video {os.path.basename(path)} không có độ dài hợp lệ.")
 
-        preprocess_fade = 0.0 if transition_seconds > 0 else max(min(transition_seconds, 0.5), 0.0)
-        if preprocess_fade > 0 or motion_blur:
-            transitioned_paths = []
-            for idx, path in enumerate(part_paths):
-                duration, has_audio = clip_meta[idx]
-                temp_path = os.path.join(td, f"transition_{idx:03d}.mp4")
-                _apply_transition_effect(
-                    src_path=path,
-                    dest_path=temp_path,
-                    fade_duration=preprocess_fade,
-                    is_first=(idx == 0),
-                    is_last=(idx == len(part_paths) - 1),
-                    clip_duration=duration,
-                    has_audio=has_audio,
-                    apply_blur=motion_blur,
+        current_paths = part_paths
+        level = 0
+        while len(current_paths) > 1:
+            next_paths: List[str] = []
+            for chunk_idx in range(0, len(current_paths), MERGE_CHUNK_SIZE):
+                chunk = current_paths[chunk_idx: chunk_idx + MERGE_CHUNK_SIZE]
+                if len(chunk) == 1:
+                    next_paths.append(chunk[0])
+                    continue
+                chunk_output = os.path.join(
+                    td, f"merged_l{level}_{chunk_idx // MERGE_CHUNK_SIZE:03d}.mp4"
                 )
-                transitioned_paths.append(temp_path)
-            part_paths = transitioned_paths
+                _concat_videos(chunk, chunk_output)
+                next_paths.append(chunk_output)
+            current_paths = next_paths
+            level += 1
 
-        if transition_seconds > 0:
-            merged_path = _merge_with_crossfade(part_paths, clip_meta, transition_seconds, td)
-        else:
-            current_paths = part_paths
-            level = 0
-            while len(current_paths) > 1:
-                next_paths: List[str] = []
-                for chunk_idx in range(0, len(current_paths), MERGE_CHUNK_SIZE):
-                    chunk = current_paths[chunk_idx: chunk_idx + MERGE_CHUNK_SIZE]
-                    if len(chunk) == 1:
-                        next_paths.append(chunk[0])
-                        continue
-                    chunk_output = os.path.join(
-                        td, f"merged_l{level}_{chunk_idx // MERGE_CHUNK_SIZE:03d}.mp4"
-                    )
-                    _concat_videos(chunk, chunk_output)
-                    next_paths.append(chunk_output)
-                current_paths = next_paths
-                level += 1
-
-            merged_path = current_paths[0]
+        merged_path = current_paths[0]
 
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         local_filename = f"merged_{timestamp_str}.mp4"

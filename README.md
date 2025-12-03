@@ -74,7 +74,7 @@ curl -X POST "http://0.0.0.0:8080/video/voiceover" \
 
 ### 4. Merge Videos (`/merge_videos`)
 
-Ghép nhiều video URL; có thể bật `transition_seconds` (transition cross-fade) và `motion_blur` để làm chuyển cảnh mượt hơn. API cũng tự động bỏ qua download nếu file đã nằm trong `videos/`.
+API này GHÉP NỐI THẲNG CÁC VIDEO THEO ĐÚNG THỨ TỰ TRONG `video_urls`. Không còn các hiệu ứng cross-fade hay motion blur để đảm bảo ổn định khi chạy trên host thật. Nếu file đã có trong thư mục `videos/` thì API tái sử dụng mà không tải lại.
 
 ```bash
 curl -X POST "http://0.0.0.0:8080/merge_videos" \
@@ -84,27 +84,23 @@ curl -X POST "http://0.0.0.0:8080/merge_videos" \
          "https://example.com/videos/scene1.mp4",
          "https://example.com/videos/scene2.mp4",
          "https://example.com/videos/scene3.mp4"
-       ],
-       "transition_seconds": 1.5,
-       "motion_blur": true
+       ]
      }'
 ```
 
 ### 5. Merge Videos Job (`/merge_videos_job`)
 
-Chạy merge ở chế độ nền: POST để tạo job (trả về `job_id`), sau đó GET `/merge_videos_job/{job_id}` để poll trạng thái và lấy `video_url` khi hoàn tất.
+Tạo job chạy nền để ghép video theo THỨ TỰ MẢNG, kết quả cuối cùng cũng chỉ đơn thuần là concat không hiệu ứng. POST để tạo job (trả về `job_id`), sau đó GET `/merge_videos_job/{job_id}` để poll trạng thái và lấy `video_url` khi hoàn tất.
 
 ```bash
-# Tạo job
+# Tạo job ghép 2 video mẫu có sẵn sau khi chạy server (các file nằm trong thư mục videos/).
 curl -X POST "http://0.0.0.0:8080/merge_videos_job" \
  -H "Content-Type: application/json" \
  -d '{
        "video_urls": [
-         "https://example.com/videos/scene1.mp4",
-         "https://example.com/videos/scene2.mp4"
-       ],
-       "transition_seconds": 0,
-       "motion_blur": false
+         "http://0.0.0.0:8080/videos/20251127_213239.mp4",
+         "http://0.0.0.0:8080/videos/20251127_213526.mp4"
+       ]
      }'
 
 # Poll kết quả (thay <JOB_ID> bằng job_id nhận được ở trên)
