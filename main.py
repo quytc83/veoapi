@@ -28,7 +28,6 @@ DEFAULT_GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 VIDEOS_DIR = os.path.join(SCRIPT_DIR, "videos")
 os.makedirs(VIDEOS_DIR, exist_ok=True)
-MERGE_CHUNK_SIZE = 5
 MERGE_DOWNLOAD_TIMEOUT = 600
 MERGE_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 MERGE_JOBS: Dict[str, Dict[str, Any]] = {}
@@ -269,66 +268,79 @@ def _aspect_ratio_from_resolution(resolution: str) -> str:
 def _concat_videos(input_paths: List[str], output_path: str):
     if not input_paths:
         raise HTTPException(400, "Không có video để merge.")
-    if len(input_paths) == 1:
-        shutil.copyfile(input_paths[0], output_path)
-        return
+    metas = [_video_metadata(path) for path in input_paths]
+    dims = next(((w, h) for _, _, _, w, h, _ in metas if w and h), None)
+    if not dims:
+        raise HTTPException(400, "Không lấy được kích thước video hợp lệ để ghép.")
+    target_width, target_height = dims
+    target_fps = next((fps for *_, fps in metas if fps), 30.0)
 
-    list_path = f"{output_path}.txt"
-    with open(list_path, "w", encoding="utf-8") as f:
-        for p in input_paths:
-            f.write(f"file '{p}'\n")
+    concat_inputs: List[Any] = []
+    for path, meta in zip(input_paths, metas):
+        duration, has_audio, _, width, height, _ = meta
+        if duration <= 0:
+            raise HTTPException(400, f"Video {os.path.basename(path)} không có độ dài hợp lệ.")
 
-    (
-        ffmpeg
-        .input(list_path, f="concat", safe=0)
-        .output(output_path, vcodec="libx264", acodec="aac", audio_bitrate="192k")
-        .overwrite_output()
-        .run(quiet=True)
-    )
-    os.remove(list_path)
-
-
-def _prepare_clip_for_merge(src_path: str, dest_path: str):
-    duration, has_audio, _ = _video_metadata(src_path)
-    if duration <= 0:
-        raise HTTPException(400, f"Video {os.path.basename(src_path)} không có độ dài hợp lệ.")
-
-    inp = ffmpeg.input(src_path)
-    video_stream = (
-        inp.video
-        .filter("trim", duration=duration)
-        .filter("setpts", "PTS-STARTPTS")
-    )
-
-    if has_audio:
-        audio_stream = (
-            inp.audio
-            .filter("apad")
-            .filter("atrim", duration=duration)
-            .filter("asetpts", "PTS-STARTPTS")
+        inp = ffmpeg.input(path)
+        if width and height:
+            video_stream = (
+                inp.video
+                .filter("scale", target_width, target_height, force_original_aspect_ratio="decrease")
+                .filter("pad", target_width, target_height, "(ow-iw)/2", "(oh-ih)/2", color="black")
+            )
+        else:
+            video_stream = ffmpeg.input(
+                f"color=c=black:s={target_width}x{target_height}:r={target_fps}",
+                f="lavfi",
+                t=max(duration, 0.1)
+            ).video
+        video_stream = (
+            video_stream
+            .filter("setsar", "1")
+            .filter("fps", fps=target_fps, round="up")
+            .filter("setpts", "PTS-STARTPTS")
         )
-    else:
-        audio_stream = (
+
+        if has_audio:
+            aresample_kwargs = {"sample_rate": 48000, "resampler": "soxr", "async": 1}
+            audio_stream = (
+                inp.audio
+                .filter("aresample", **aresample_kwargs)
+                .filter("asetpts", "PTS-STARTPTS")
+            )
+        else:
+            audio_stream = (
+                ffmpeg
+                .input("anullsrc=r=48000:cl=stereo", f="lavfi", t=max(duration, 0.1))
+                .audio
+            )
+
+        concat_inputs.extend([video_stream, audio_stream])
+
+    concat_stream = ffmpeg.concat(*concat_inputs, v=1, a=1, n=len(input_paths)).node
+    video_stream = concat_stream[0]
+    audio_stream = concat_stream[1]
+
+    try:
+        (
             ffmpeg
-            .input("anullsrc=r=48000:cl=stereo", f="lavfi")
-            .filter("atrim", duration=duration)
-            .filter("asetpts", "PTS-STARTPTS")
+            .output(
+                video_stream,
+                audio_stream,
+                output_path,
+                vcodec="libx264",
+                acodec="aac",
+                audio_bitrate="192k",
+                pix_fmt="yuv420p",
+                preset="veryfast",
+                movflags="+faststart",
+            )
+            .overwrite_output()
+            .run(capture_stdout=True, capture_stderr=True)
         )
-
-    (
-        ffmpeg
-        .output(
-            video_stream,
-            audio_stream,
-            dest_path,
-            vcodec="libx264",
-            acodec="aac",
-            audio_bitrate="192k",
-            pix_fmt="yuv420p",
-        )
-        .overwrite_output()
-        .run(quiet=True)
-    )
+    except ffmpeg.Error as exc:
+        stderr = exc.stderr.decode("utf-8", errors="ignore") if exc.stderr else str(exc)
+        raise HTTPException(500, f"FFmpeg concat failed: {stderr[-400:]}") from exc
 
 
 def _find_existing_media_path(url_str: str) -> Optional[str]:
@@ -342,7 +354,26 @@ def _find_existing_media_path(url_str: str) -> Optional[str]:
     return None
 
 
-def _video_metadata(video_path: str) -> tuple[float, bool, Optional[float]]:
+def _parse_frame_rate(rate_str: Optional[str]) -> Optional[float]:
+    if not rate_str:
+        return None
+    if "/" in rate_str:
+        num_str, den_str = rate_str.split("/", 1)
+        try:
+            num = float(num_str)
+            den = float(den_str)
+            if den == 0:
+                return None
+            return num / den
+        except ValueError:
+            return None
+    try:
+        return float(rate_str)
+    except ValueError:
+        return None
+
+
+def _video_metadata(video_path: str) -> tuple[float, bool, Optional[float], Optional[int], Optional[int], Optional[float]]:
     try:
         probe = ffmpeg.probe(video_path)
     except FileNotFoundError:
@@ -354,12 +385,22 @@ def _video_metadata(video_path: str) -> tuple[float, bool, Optional[float]]:
         raise HTTPException(400, f"Không đọc được metadata video: {e}")
 
     has_audio = False
+    width: Optional[int] = None
+    height: Optional[int] = None
+    frame_rate: Optional[float] = None
 
     duration_candidates = []
     audio_duration_candidates = []
     if "format" in probe and "duration" in probe["format"]:
         duration_candidates.append(probe["format"]["duration"])
     for stream in probe.get("streams", []):
+        if stream.get("codec_type") == "video":
+            if width is None and stream.get("width"):
+                width = int(stream["width"])
+            if height is None and stream.get("height"):
+                height = int(stream["height"])
+            if frame_rate is None:
+                frame_rate = _parse_frame_rate(stream.get("avg_frame_rate") or stream.get("r_frame_rate"))
         if stream.get("codec_type") == "audio":
             has_audio = True
             if "duration" in stream:
@@ -389,7 +430,7 @@ def _video_metadata(video_path: str) -> tuple[float, bool, Optional[float]]:
         except (TypeError, ValueError):
             continue
 
-    return duration, has_audio, audio_duration
+    return duration, has_audio, audio_duration, width, height, frame_rate
 
 
 def _apply_atempo_chain(stream, factor: float):
@@ -746,7 +787,7 @@ def add_voiceover(body: VideoVoiceoverBody, request: Request):
             _download_to_path(str(body.audio_url), audio_path, timeout=300)
 
         audio_duration = _audio_duration_seconds(audio_path, require_mp3_wav=True)
-        video_duration, has_original_audio, _ = _video_metadata(video_path)
+        video_duration, has_original_audio, _, _, _, _ = _video_metadata(video_path)
         final_duration = max(audio_duration, video_duration)
         if video_duration <= 0:
             raise HTTPException(400, "Video không có độ dài hợp lệ.")
@@ -891,31 +932,9 @@ def _execute_merge_videos(video_urls: List[str], transition_seconds: float, moti
         if not part_paths:
             raise HTTPException(400, "Không tải được video nào.")
 
-        normalized_paths: List[str] = []
-        for idx, path in enumerate(part_paths):
-            normalized_path = os.path.join(td, f"normalized_{idx:03d}.mp4")
-            _prepare_clip_for_merge(path, normalized_path)
-            normalized_paths.append(normalized_path)
-        part_paths = normalized_paths
-
-        current_paths = part_paths
-        level = 0
-        while len(current_paths) > 1:
-            next_paths: List[str] = []
-            for chunk_idx in range(0, len(current_paths), MERGE_CHUNK_SIZE):
-                chunk = current_paths[chunk_idx: chunk_idx + MERGE_CHUNK_SIZE]
-                if len(chunk) == 1:
-                    next_paths.append(chunk[0])
-                    continue
-                chunk_output = os.path.join(
-                    td, f"merged_l{level}_{chunk_idx // MERGE_CHUNK_SIZE:03d}.mp4"
-                )
-                _concat_videos(chunk, chunk_output)
-                next_paths.append(chunk_output)
-            current_paths = next_paths
-            level += 1
-
-        merged_path = current_paths[0]
+        merged_temp_path = os.path.join(td, "merged_temp.mp4")
+        _concat_videos(part_paths, merged_temp_path)
+        merged_path = merged_temp_path
 
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         local_filename = f"merged_{timestamp_str}.mp4"
